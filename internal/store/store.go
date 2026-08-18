@@ -72,13 +72,21 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// InsertEvent stores the raw delivery.
-func (s *Store) InsertEvent(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+// InsertEvent stores the raw delivery and reports whether a new row was
+// created. If event_id already exists the INSERT is silently skipped
+// (ON CONFLICT DO NOTHING) and inserted=false is returned. This makes
+// deduplication atomic at the database level, closing the TOCTOU gap
+// between EventExists and a plain INSERT.
+func (s *Store) InsertEvent(ctx context.Context, e Event) (inserted bool, err error) {
+	tag, err := s.pool.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
-		 VALUES ($1, $2, $3, $4)`,
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
 		e.EventID, e.CallID, e.AccountID, e.Payload)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // UpsertCall creates or refreshes the call record for this event.

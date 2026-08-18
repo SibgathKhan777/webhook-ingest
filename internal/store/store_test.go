@@ -22,15 +22,17 @@ func TestInsertEventDuplicateIsRejected(t *testing.T) {
 		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
 	}
 
-	if err := s.InsertEvent(ctx, evt); err != nil {
+	if inserted, err := s.InsertEvent(ctx, evt); err != nil {
 		t.Fatalf("first InsertEvent: %v", err)
+	} else if !inserted {
+		t.Fatal("first InsertEvent: expected inserted=true for a new event")
 	}
 
 	// A second insert of the same event_id must be a no-op (returns false, nil).
-	// On buggy code (no UNIQUE constraint, plain INSERT) this succeeds and
-	// creates a second row — the count check below catches it.
-	if err := s.InsertEvent(ctx, evt); err != nil {
+	if inserted, err := s.InsertEvent(ctx, evt); err != nil {
 		t.Fatalf("second InsertEvent returned unexpected error: %v", err)
+	} else if inserted {
+		t.Fatal("second InsertEvent: expected inserted=false for a duplicate event_id")
 	}
 
 	var count int
@@ -62,7 +64,7 @@ func TestInsertEventThenExists(t *testing.T) {
 		t.Fatal("expected event to be absent before insert")
 	}
 
-	if err := s.InsertEvent(ctx, evt); err != nil {
+	if _, err := s.InsertEvent(ctx, evt); err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 
