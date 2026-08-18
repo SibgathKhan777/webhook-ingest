@@ -61,6 +61,14 @@ func NewStore(t *testing.T) *store.Store {
 // Postgres and Redis, and returns it alongside the store for assertions.
 func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
+	srv, s, _ := NewServerAndService(t)
+	return srv, s
+}
+
+// NewServerAndService is like NewServer but also returns the ingest.Service so
+// tests can call Service.Wait() to drain in-flight recording goroutines.
+func NewServerAndService(t *testing.T) (*httptest.Server, *store.Store, *ingest.Service) {
+	t.Helper()
 	cfg := config.Load()
 
 	s := NewStore(t)
@@ -76,5 +84,5 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 
 	srv := httptest.NewServer(httpapi.NewRouter(svc, log))
 	t.Cleanup(srv.Close)
-	return srv, s
+	return srv, s, svc
 }

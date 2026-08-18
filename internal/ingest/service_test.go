@@ -119,6 +119,78 @@ func TestRecordingIsMarkedProcessedAfterDelay(t *testing.T) {
 	t.Fatal("recording_processed is still false 500ms after ingestion — recording goroutine failed silently")
 }
 
+// TestShutdownWithoutWaitAbandonsPendingRecordings demonstrates that closing
+// the server WITHOUT calling svc.Wait() can leave recording goroutines mid-flight.
+// This is the bug in main.go: srv.Shutdown() returns as soon as HTTP connections
+// drain, but recording goroutines are still sleeping. The process then exits and
+// they are killed — recording_processed is never written.
+//
+// We simulate this by checking recording_processed immediately after srv.Close()
+// (before the 50ms recordingWork sleep finishes). It must be false, proving the
+// goroutine hasn't finished yet. A real process exit at this point would lose it.
+func TestShutdownWithoutWaitAbandonsPendingRecordings(t *testing.T) {
+	srv, st, svc := testutil.NewServerAndService(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// Close immediately — do NOT call svc.Wait().
+	// The recording goroutine is still sleeping (recordingWork = 50ms).
+	srv.Close()
+
+	// Immediately after srv.Close(), recording_processed must still be false:
+	// the goroutine hasn't had time to complete. This is the window where a
+	// real process exit would abandon the work.
+	var processed bool
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT recording_processed FROM calls WHERE call_id = $1`, callID,
+	).Scan(&processed); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if processed {
+		t.Fatal("recording_processed was true immediately after srv.Close() without Wait() — " +
+			"test needs goroutine still to be in-flight to demonstrate the shutdown race")
+	}
+
+	// Drain now (what main.go must do) so cleanup doesn't leave orphaned goroutines.
+	svc.Wait()
+}
+
+// TestGracefulShutdownDrainsRecordingGoroutines verifies that calling
+// svc.Wait() after srv.Close() ensures all in-flight recording goroutines
+// complete before the caller returns. Without Wait() in the shutdown path,
+// goroutines that are mid-sleep or mid-DB-write when the process exits simply
+// disappear — calls land but recording_processed is never set.
+func TestGracefulShutdownDrainsRecordingGoroutines(t *testing.T) {
+	srv, st, svc := testutil.NewServerAndService(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// Simulate graceful shutdown: stop accepting new connections, then
+	// wait for in-flight recording goroutines to finish.
+	srv.Close()
+	svc.Wait() // this is what main.go must call — the test verifies it works
+
+	var processed bool
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT recording_processed FROM calls WHERE call_id = $1`, callID,
+	).Scan(&processed); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !processed {
+		t.Fatal("recording_processed is false after srv.Close()+svc.Wait() — goroutines were not drained")
+	}
+}
+
 // TestConcurrentDuplicateDeliveryIsIdempotent fires the same event_id from
 // multiple goroutines simultaneously, reproducing the TOCTOU race between
 // EventExists and InsertEvent. Without an atomic INSERT ON CONFLICT the DB
