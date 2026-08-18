@@ -1,6 +1,7 @@
 package stats_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/stats"
@@ -28,5 +29,32 @@ func TestCacheGetUnknownAccountIsZero(t *testing.T) {
 	c := stats.NewCache()
 	if got := c.Get("nobody"); got.CallCount != 0 || got.TotalDurationSec != 0 {
 		t.Fatalf("got %+v, want zero value", got)
+	}
+}
+
+// TestCacheRecordIsSafeUnderConcurrency exercises Record from many goroutines
+// simultaneously. Run with -race to detect the missing write-lock in Record —
+// on buggy code the race detector flags a concurrent map read+write.
+func TestCacheRecordIsSafeUnderConcurrency(t *testing.T) {
+	c := stats.NewCache()
+	const goroutines = 50
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	start := make(chan struct{})
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			c.Record("acc_race", 1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	got := c.Get("acc_race")
+	if got.CallCount != goroutines {
+		t.Fatalf("CallCount = %d, want %d", got.CallCount, goroutines)
 	}
 }
