@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -82,6 +83,40 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
 	}
+}
+
+// TestRecordingIsMarkedProcessedAfterDelay verifies that the recording
+// processing goroutine actually marks the call as processed even though the
+// HTTP request context is cancelled as soon as the handler returns 200.
+// On buggy code, processRecording is launched with the request ctx, which is
+// already cancelled by the time Sleep finishes, so MarkRecordingProcessed
+// always fails silently (the error is swallowed by // TODO: handle).
+func TestRecordingIsMarkedProcessedAfterDelay(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// Give the background goroutine longer than recordingWork (50ms) to finish.
+	// We poll up to 500ms so the test is not flaky on a slow CI machine.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		var processed bool
+		if err := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID,
+		).Scan(&processed); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if processed {
+			return // success
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("recording_processed is still false 500ms after ingestion — recording goroutine failed silently")
 }
 
 // TestConcurrentDuplicateDeliveryIsIdempotent fires the same event_id from
