@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,7 +23,13 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+	wg    sync.WaitGroup // tracks in-flight recording goroutines
 }
+
+// Wait blocks until all background recording goroutines have finished.
+// Call this after the HTTP server has stopped accepting new requests so that
+// in-flight recordings are not abandoned on graceful shutdown.
+func (s *Service) Wait() { s.wg.Wait() }
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
@@ -73,10 +80,16 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
+	// We pass context.Background() — NOT the request ctx — because the HTTP
+	// handler returns (and the request ctx is cancelled) before the goroutine
+	// finishes. Using the request ctx caused MarkRecordingProcessed to always
+	// fail silently once the 200 response was sent.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			defer s.wg.Done()
+			if err := s.processRecording(context.Background(), rec); err != nil {
+				s.log.Error("recording processing failed", "call_id", rec.CallID, "err", err)
 			}
 		}()
 	}
