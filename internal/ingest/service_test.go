@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
@@ -80,5 +81,56 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+// TestConcurrentDuplicateDeliveryIsIdempotent fires the same event_id from
+// multiple goroutines simultaneously, reproducing the TOCTOU race between
+// EventExists and InsertEvent. Without an atomic INSERT ON CONFLICT the DB
+// ends up with multiple event rows and the account stats are double-counted.
+func TestConcurrentDuplicateDeliveryIsIdempotent(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	const concurrency = 10
+	body := eventJSON(eventID, callID, accountID)
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	start := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			<-start // all goroutines fire at once
+			resp, err := http.Post(srv.URL+"/webhooks/calls", "application/json", strings.NewReader(body))
+			if err != nil {
+				return
+			}
+			_ = resp.Body.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Exactly one event row must be stored, regardless of concurrency.
+	var eventCount int
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM events WHERE event_id = $1`, eventID,
+	).Scan(&eventCount); err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Errorf("events table has %d rows for event_id %s, want 1 (idempotency race)", eventCount, eventID)
+	}
+
+	// Account stats must reflect exactly one call.
+	dbStats, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if dbStats.CallCount != 1 {
+		t.Errorf("account_stats.call_count = %d, want 1 (stats were double-counted)", dbStats.CallCount)
 	}
 }

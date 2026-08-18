@@ -8,6 +8,42 @@ import (
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
+// TestInsertEventDuplicateIsRejected verifies that the events table enforces
+// uniqueness on event_id at the database level. Without a UNIQUE constraint
+// two racing inserters can both see "not exists" and both succeed, leading to
+// duplicate rows and double-counted stats.
+func TestInsertEventDuplicateIsRejected(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	if err := s.InsertEvent(ctx, evt); err != nil {
+		t.Fatalf("first InsertEvent: %v", err)
+	}
+
+	// A second insert of the same event_id must be a no-op (returns false, nil).
+	// On buggy code (no UNIQUE constraint, plain INSERT) this succeeds and
+	// creates a second row — the count check below catches it.
+	if err := s.InsertEvent(ctx, evt); err != nil {
+		t.Fatalf("second InsertEvent returned unexpected error: %v", err)
+	}
+
+	var count int
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM events WHERE event_id = $1`, eventID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("events table has %d rows for event_id %s, want 1 — missing UNIQUE constraint lets duplicates through", count, eventID)
+	}
+}
+
 func TestInsertEventThenExists(t *testing.T) {
 	s := testutil.NewStore(t)
 	eventID, callID, accountID := testutil.IDs(t, s)
