@@ -60,4 +60,12 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
 	}
+
+	// Drain in-flight recording goroutines before exiting. srv.Shutdown waits
+	// for HTTP connections to close, but background goroutines launched by
+	// Ingest are independent. Without this call they are killed mid-flight on
+	// process exit and recording_processed is never written to the database.
+	log.Info("waiting for in-flight recording goroutines to finish")
+	svc.Wait()
+	log.Info("all goroutines drained, exiting")
 }
